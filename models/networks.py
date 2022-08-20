@@ -116,7 +116,7 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], has_projection_head=False):
     """Create a generator
 
     Parameters:
@@ -153,7 +153,7 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
     elif netG == 'unet_128':
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
-        net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+        net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout, has_projection_head=has_projection_head)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -436,7 +436,7 @@ class ResnetBlock(nn.Module):
 class UnetGenerator(nn.Module):
     """Create a Unet-based generator"""
 
-    def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False):
+    def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, has_projection_head=False):
         """Construct a Unet generator
         Parameters:
             input_nc (int)  -- the number of channels in input images
@@ -459,11 +459,56 @@ class UnetGenerator(nn.Module):
         unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
         unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
         self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, norm_layer=norm_layer)  # add the outermost layer
+        self.has_projection_head = has_projection_head
+
+        if has_projection_head:
+            # add mlp projection head
+            # https://github.com/sthalles/SimCLR/blob/master/models/resnet_simclr.py
+            dim_mlp = 512 # 512 x 1 x 1 flatten
+            dim_projection_out = 128 # same as MICCAI 2021 sem-sup contrast
+            self.projection_head = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), nn.Linear(dim_mlp, dim_projection_out))
+
+    def _forward_with_projection_head(self, input):
+        # 1. fowward until the hidden feature, input shape [4,1,256,256]
+        enc_0 = self.model.model[0](input) # [4,64,128,128]
+        enc_1 = self.model.model[1].model[0:3](enc_0) # [4, 128, 64, 64]
+        enc_2 = self.model.model[1].model[3].model[0:3](enc_1) # [4, 256, 32, 32]
+        enc_3 = self.model.model[1].model[3].model[3].model[0:3](enc_2) # [4, 512, 16, 16]
+        enc_4 = self.model.model[1].model[3].model[3].model[3].model[0:3](enc_3) # [4, 512, 8, 8]
+        enc_5 = self.model.model[1].model[3].model[3].model[3].model[3].model[0:3](enc_4) # [4, 512, 4, 4]
+        enc_6 = self.model.model[1].model[3].model[3].model[3].model[3].model[3].model[0:3](enc_5) # [4, 512, 2, 2]
+        enc_7 = self.model.model[1].model[3].model[3].model[3].model[3].model[3].model[3].model[0:3](enc_6) # [4, 512, 1, 1], end of unet encoding
+
+        # 2. add projection head, similar to simclr
+        enc7_flat = torch.flatten(enc_7, 1) # [4, 512]
+        projection = self.projection_head(enc7_flat) # [4, 128]
+
+        # 3. continue to decode the hidden feature until end of the model 
+        # ini dec_6, [3:] are layers; in dec_5, 4, ... [3] is a block, so start from 4
+        # add skip connection manually
+        dec_7 = self.model.model[1].model[3].model[3].model[3].model[3].model[3].model[3].model[3:](enc_7) # [4,512, 2, 2]
+        dec_7 = torch.cat([dec_7, enc_6], 1) # skip connection [4, 1024, 2, 2]
+        dec_6 = self.model.model[1].model[3].model[3].model[3].model[3].model[3].model[4:](dec_7) # [4,512, 4, 4]
+        dec_6 = torch.cat([dec_6, enc_5], 1) # skip connection [4, 1024, 4, 4]
+        dec_5 = self.model.model[1].model[3].model[3].model[3].model[3].model[4:](dec_6) # [4,512, 8, 8]
+        dec_5 = torch.cat([dec_5, enc_4], 1) # skip connection [4, 1024, 8, 8]
+        dec_4 = self.model.model[1].model[3].model[3].model[3].model[4:](dec_5) # [4,512, 16, 16]
+        dec_4 = torch.cat([dec_4, enc_3], 1) # skip connection [4, 1024, 16, 16]
+        dec_3 = self.model.model[1].model[3].model[3].model[4:](dec_4) # [4,256, 32, 32]
+        dec_3 = torch.cat([dec_3, enc_2], 1) # skip connection [4, 512, 32, 32]
+        dec_2 = self.model.model[1].model[3].model[4:](dec_3) # [4,128, 64, 64]
+        dec_2 = torch.cat([dec_2, enc_1], 1) # skip connection [4, 256, 64, 64]
+        dec_1 = self.model.model[1].model[4:](dec_2) # [4,64, 128, 128]
+        dec_1 = torch.cat([dec_1, enc_0], 1) # skip connection [4, 128, 128, 128]
+        dec_0 = self.model.model[2:](dec_1) # [4,1, 256, 256]
+
+        return projection, dec_0
 
     def forward(self, input):
-        """Standard forward"""
-        return self.model(input)
-
+        if self.has_projection_head:
+            return self._forward_with_projection_head(input)
+        else:
+            return self.model(input)
 
 class UnetSkipConnectionBlock(nn.Module):
     """Defines the Unet submodule with skip connection.

@@ -3,7 +3,10 @@ import itertools
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
-
+from .unet_con import GlobalConUnet, LocalConUnet2, LocalConUnet3, UNet, MLP
+from nt_xent import NTXentLoss
+import torch.nn.functional as F
+# 2: existing local contrastive 3: 2021 MICCAI local contrastive
 
 class CycleGANModel(BaseModel):
     """
@@ -52,7 +55,21 @@ class CycleGANModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
+        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B', 'cfBrA', 'crBfA']
+        # contrast loss
+        self.global_contrast_loss = NTXentLoss(self.device, temperature=0.7, use_cosine_similarity=False)
+        self.local_contrast_loss = NTXentLoss(self.device, temperature=0.7, use_cosine_similarity=False) 
+        # temperature=? use cosine similarity = ?; currently use same global and local loss
+
+        # contrast feature
+        self.fake_B_rec_A_projection = None
+        self.aug_fake_B_rec_A_projection = None
+        self.real_B_fake_A_projection = None
+        self.aug_real_B_fake_A_projection = None
+        self.loss_cfBrA = None # fake B rec A
+        self.loss_crBfA = None # real B fake A
+
+
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
         visual_names_B = ['real_B', 'fake_A', 'rec_B']
@@ -71,9 +88,9 @@ class CycleGANModel(BaseModel):
         # The naming is different from those used in the paper.
         # Code (vs. paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
         self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, has_projection_head=False)
         self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, has_projection_head=True)
 
         if self.isTrain:  # define discriminators
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
@@ -91,6 +108,7 @@ class CycleGANModel(BaseModel):
             self.criterionCycle = torch.nn.L1Loss()
             self.criterionIdt = torch.nn.L1Loss()
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
+            # TODO is projection head in parameters() ?
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizers.append(self.optimizer_G)
@@ -105,16 +123,26 @@ class CycleGANModel(BaseModel):
         The option 'direction' can be used to swap domain A and domain B.
         """
         AtoB = self.opt.direction == 'AtoB'
-        self.real_A = input['A' if AtoB else 'B'].to(self.device)
-        self.real_B = input['B' if AtoB else 'A'].to(self.device)
+        # TODO debug dataset to allow batchsize > 1
+        self.real_A = input['A' if AtoB else 'B'].to(self.device) # shape [4,1,256, 256]
+        self.real_B = input['B' if AtoB else 'A'].to(self.device) # shape [4,1,256, 256]
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
+        self.aug_A = input['augmented_A'].to(self.device) # shape [4,1,256, 256]
+        self.aug_B = input['augmented_B'].to(self.device) # shape [4,1,256, 256]
+
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
-        self.fake_B = self.netG_A(self.real_A)  # G_A(A)
-        self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A))
-        self.fake_A = self.netG_B(self.real_B)  # G_B(B)
-        self.rec_B = self.netG_A(self.fake_A)   # G_A(G_B(B))
+        self.fake_B = self.netG_A(self.real_A)  # G_A(A) shape [4,1,256, 256]
+        self.fake_B_rec_A_projection, self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A)) shape [4,1,256, 256]
+        self.real_B_fake_A_projection, self.fake_A = self.netG_B(self.real_B)  # G_B(B) shape [4,1,256, 256]
+        self.rec_B = self.netG_A(self.fake_A)   # G_A(G_B(B)) shape [4,1,256, 256]
+
+        # contrast
+        self.aug_fake_B = self.netG_A(self.aug_A)  # G_A(A) shape [4,1,256, 256]
+        self.aug_fake_B_rec_A_projection, self.aug_rec_A =  self.netG_B(self.aug_fake_B) # shape [4,1,256, 256]
+
+        self.aug_real_B_fake_A_projection, self.aug_fake_A = self.netG_B(self.aug_B)  # G_B(B) shape [4,1,256, 256]
 
     def backward_D_basic(self, netD, real, fake):
         """Calculate GAN loss for the discriminator
@@ -149,7 +177,11 @@ class CycleGANModel(BaseModel):
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
 
     def backward_G(self):
-        """Calculate the loss for generators G_A and G_B"""
+        """Calculate the loss for generators G_A and G_B
+        
+        Add contrastive loss to G_B. Refer to SIFA architecture figure.
+        - To the encoding part of G_B, and add projection head. Refer to SimClr.
+        """
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
@@ -159,7 +191,7 @@ class CycleGANModel(BaseModel):
             self.idt_A = self.netG_A(self.real_B)
             self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_idt
             # G_B should be identity if real_A is fed: ||G_B(A) - A||
-            self.idt_B = self.netG_B(self.real_A)
+            _, self.idt_B = self.netG_B(self.real_A) # ignore the projection
             self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_idt
         else:
             self.loss_idt_A = 0
@@ -173,8 +205,14 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+
+        # contrast loss
+        self.loss_cfBrA = self.global_contrast_loss(self.fake_B_rec_A_projection, self.aug_fake_B_rec_A_projection)
+        self.loss_crBfA = self.global_contrast_loss(self.real_B_fake_A_projection, self.aug_real_B_fake_A_projection)
         # combined loss and calculate gradients
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B + self.loss_cfBrA +\
+            self.loss_crBfA
+        # self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
         self.loss_G.backward()
 
     def optimize_parameters(self):
